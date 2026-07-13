@@ -14,6 +14,7 @@ from module import SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
+
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
 
@@ -26,23 +27,62 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D)
-    act_emb = output["act_emb"]
+    emb = output["emb"]          # (B, T, D)
+    act_emb = output["act_emb"]  # (B, T, A_emb)
+    B, T, D = emb.shape
 
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, : ctx_len]
+    # ------------------------------------------------------------------
+    # Build sliding windows of length ctx_len over the frame embeddings
+    # windows: (B, T - ctx_len + 1, ctx_len, D)
+    # ------------------------------------------------------------------
+    windows = emb.unfold(dimension=1, size=ctx_len, step=1)
+    windows = windows.permute(0, 1, 3, 2)  # -> (B, n_windows, ctx_len, D)
 
-    tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    T_valid = windows.size(1) - n_preds
+    if T_valid <= 0:
+        output["pred_loss"] = torch.tensor(0.0, device=emb.device)
+        output["sigreg_loss"] = torch.tensor(0.0, device=emb.device)
+        output["loss"] = torch.tensor(0.0, device=emb.device)
+        losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+        self.log_dict(losses_dict, on_step=True, sync_dist=True)
+        return output
+
+    # Input windows
+    state_windows = windows[:, :T_valid]  # (B, T_valid, 3, D)
+    flat_states = state_windows.reshape(B * T_valid, ctx_len, D)
+    states = self.model.encode_state({"emb": flat_states})["state"]       # (B*T_valid, D)
+
+    # TARGET: single frame, no overlap
+    target_frames = emb[:, ctx_len + n_preds - 1:]  # (B, T_valid, D)
+    flat_targets = target_frames.unsqueeze(2).reshape(B * T_valid, 1, D)
+    next_states = self.model.encode_state({"emb": flat_targets})["state"]  # (B*T_valid, D)
+
+    # === RESHAPE BACK ===
+    states = states.reshape(B, T_valid, D)
+    next_states = next_states.reshape(B, T_valid, D)
+
+    # Actions at the end of each input window
+    actions = act_emb[:, ctx_len - 1 : T - n_preds]  # (B, T_valid, A_emb)
+
+    # Predict next state embeddings from current state + action
+    flat_states = states.reshape(B * T_valid, D)
+    flat_actions = actions.reshape(B * T_valid, -1)
+    pred_next_states = self.model.predict(flat_states, flat_actions)
+    pred_next_states = pred_next_states.reshape(B, T_valid, D)
 
     # LeWM loss
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["pred_loss"] = (pred_next_states - next_states).pow(2).mean()
+    
+    # SIGReg on the *state* embeddings, not raw frame embeddings
+    all_states = torch.cat([states, next_states], dim=0)  # (2*B, T_valid, D)
+    output["sigreg_loss"] = self.sigreg(all_states.transpose(0, 1))
+    
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
+
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
@@ -84,6 +124,27 @@ def run(cfg):
 
     world_model = hydra.utils.instantiate(cfg.model)
 
+    # MANUAL CHECKPOINT LOADING
+    run_id = cfg.get("subdir") or ""
+    run_dir = Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id)
+    
+    # Find latest checkpoint in run_dir or subfolders
+    ckpt_files = []
+    for path in [run_dir] + list(run_dir.iterdir()):
+        if path.is_dir():
+            ckpt_files.extend(path.glob("*.pt"))
+            ckpt_files.extend(path.glob("*.ckpt"))
+    
+    if ckpt_files:
+        ckpt_path = sorted(ckpt_files)[-1]  # latest
+        print(f"Loading weights from {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        world_model.load_state_dict(state_dict, strict=False)
+        print("Weights loaded successfully")
+    else:
+        print("No checkpoint found, starting from scratch")
+
     optimizers = {
         'model_opt': {
             "modules": 'model',
@@ -104,9 +165,6 @@ def run(cfg):
     ##########################
     ##       training       ##
     ##########################
-
-    run_id = cfg.get("subdir") or ""
-    run_dir = Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id)
 
     logger = None
     if cfg.wandb.enabled:

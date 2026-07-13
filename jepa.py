@@ -1,5 +1,7 @@
 """JEPA Implementation"""
 
+
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -15,27 +17,25 @@ class JEPA(nn.Module):
         encoder,
         predictor,
         action_encoder,
+        state_transformer,
         projector=None,
-        pred_proj=None,
     ):
         super().__init__()
 
         self.encoder = encoder
         self.predictor = predictor
         self.action_encoder = action_encoder
+        self.state_transformer = state_transformer
         self.projector = projector or nn.Identity()
-        self.pred_proj = pred_proj or nn.Identity()
 
     def encode(self, info):
-        """Encode observations and actions into embeddings.
-        info: dict with pixels and action keys
-        """
-
         pixels = info['pixels'].float()
         b = pixels.size(0)
-        pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
+        if pixels.ndim == 4:  # (B, C, H, W) — single frame, add time dim
+            pixels = pixels.unsqueeze(1)
+        pixels = rearrange(pixels, "b t ... -> (b t) ...")
         output = self.encoder(pixels, interpolate_pos_encoding=True)
-        pixels_emb = output.last_hidden_state[:, 0]  # cls token
+        pixels_emb = output.last_hidden_state[:, 0]
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
@@ -44,17 +44,32 @@ class JEPA(nn.Module):
 
         return info
 
-    def predict(self, emb, act_emb):
-        """Predict next state embedding
-        emb: (B, T, D)
-        act_emb: (B, T, A_emb)
+    def encode_state(self, info):
+        emb_windows = info["emb"]  # (B, H, D)
+        B, H, D = emb_windows.shape
+        
+        x = emb_windows + self.state_transformer.pos_embedding[:, :H]
+        x = self.state_transformer.dropout(x)
+        x = self.state_transformer.transformer(x)
+        
+        info["state"] = x[:, -1, :]  # (B, D)
+        return info
+
+    def predict(self, state_emb, act_emb):
+        """Predict next state embedding from current state and action.
+        
+        Args:
+            state_emb: (B, D) -- single state embeddings
+            act_emb: (B, A_emb) -- single action embeddings
+            
+        Returns:
+            preds: (B, D) -- predicted next state embeddings
         """
-        preds = self.predictor(emb, act_emb)
-        preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
-        preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
+        x = torch.cat([state_emb, act_emb], dim=-1)  # (B, D + A_emb)
+        preds = self.predictor(x)                   # (B, D)
         return preds
 
-    ####################
+     ####################
     ## Inference only ##
     ####################
 
@@ -69,64 +84,66 @@ class JEPA(nn.Module):
         assert "pixels" in info, "pixels not in info_dict"
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
-        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
-        info["action"] = act_0
+        _, act_future = torch.split(action_sequence, [H, T - H], dim=2)
         n_steps = T - H
 
         # copy and encode initial info dict
-        _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
+        _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v) and k != "action"}
         _init = self.encode(_init)
-        emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+        _init = self.encode_state(_init)
+        state = _init["state"].unsqueeze(1).expand(B, S, -1)  # (B, S, D)
         _init = {k: detach_clone(v) for k, v in _init.items()}
 
         # flatten batch and sample dimensions for rollout
-        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
-        act = rearrange(act_0, "b s ... -> (b s) ...")
+        state = rearrange(state, "b s d -> (b s) d").clone()
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
 
         # rollout predictor autoregressively for n_steps
-        HS = history_size
+        pred_states = [state.unsqueeze(1)]  # (list of (B*S, 1, D))
         for t in range(n_steps):
-            act_emb = self.action_encoder(act)
-            emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-            act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
-            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
-            emb = torch.cat([emb, pred_emb], dim=1)  # (BS, T+1, D)
+            action = act_future[:, t : t + 1]       # (B*S, 1, 10)
+            action_emb = self.action_encoder(action) # (B*S, 1, A_emb)
+            act_emb = action_emb.squeeze(1)         # (B*S, A_emb)
+            
+            old_state = state.clone()  # SAVE BEFORE PREDICT
+            state = self.predict(state, act_emb)    # (B*S, D)
+            pred_states.append(state.unsqueeze(1))  # (B*S, 1, D)
+            
 
-            next_act = act_future[:, t : t + 1, :]  # (BS, 1, action_dim)
-            act = torch.cat([act, next_act], dim=1)  # (BS, T+1, action_dim)
+        pred_states = torch.cat(pred_states, dim=1)   # (B*S, n_steps+1, D)
 
-        # predict the last state
-        act_emb = self.action_encoder(act)  # (BS, T, A_emb)
-        emb_trunc = emb[:, -HS:]  # (BS, HS, D)
-        act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
-        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
-        emb = torch.cat([emb, pred_emb], dim=1)
 
         # unflatten batch and sample dimensions
-        pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
-        info["predicted_emb"] = pred_rollout
+        pred_rollout = rearrange(pred_states, "(b s) ... -> b s ...", b=B, s=S)
+        info["predicted_states"] = pred_rollout
 
         return info
+    
+
 
     def criterion(self, info_dict: dict):
-        """Compute the cost between predicted embeddings and goal embeddings."""
-        pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
-        goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
+        """Compute the cost between predicted terminal state and goal state."""
+        pred_states = info_dict["predicted_states"]  # (B, S, T-H+1, D)
+        goal_state = info_dict["goal_state"]  # (B, D)
 
-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        # Take the last predicted state (terminal state)
+        pred_terminal = pred_states[:, :, -1, :]  # (B, S, D)
 
-        # return last-step cost per action candidate
+        # Expand goal_state to match action samples dimension
+        if goal_state.ndim == 2:
+            goal_state = goal_state.unsqueeze(1)  # (B, 1, D)
+
+        # MSE cost per action candidate
         cost = F.mse_loss(
-            pred_emb[..., -1:, :],
-            goal_emb[..., -1:, :].detach(),
+            pred_terminal,
+            goal_state.detach(),
             reduction="none",
-        ).sum(dim=tuple(range(2, pred_emb.ndim)))  # (B, S)
+        ).sum(dim=-1)  # (B, S)
 
         return cost
 
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
-        """ Compute the cost of action candidates given an info dict with goal and initial state."""
+
 
         assert "goal" in info_dict, "goal not in info_dict"
 
@@ -135,19 +152,31 @@ class JEPA(nn.Module):
             if torch.is_tensor(info_dict[k]):
                 info_dict[k] = info_dict[k].to(device)
 
-        goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
-        goal["pixels"] = goal["goal"]
+        # --- Goal encoding ---
+        if "goal_pixels_window" in info_dict:
+            goal = {"pixels": info_dict["goal_pixels_window"]}
+            goal = self.encode(goal)
+            goal_emb = goal["emb"]
+        else:
+            goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
+            goal["pixels"] = goal["goal"]
+            for k in info_dict:
+                if k.startswith("goal_"):
+                    goal[k[len("goal_"):]] = goal.pop(k)
+            goal.pop("action", None)
+            goal = self.encode(goal)
+            goal_emb = goal["emb"]  # (B, 1, D)
 
-        for k in info_dict:
-            if k.startswith("goal_"):
-                goal[k[len("goal_") :]] = goal.pop(k)
+        info_dict["goal_state"] = self.encode_state({"emb": goal_emb})["state"]
+    
 
-        goal.pop("action")
-        goal = self.encode(goal)
-
-        info_dict["goal_emb"] = goal["emb"]
+        # --- Rollout ---
         info_dict = self.rollout(info_dict, action_candidates)
-
         cost = self.criterion(info_dict)
-        
+
+        print(f"[get_cost] costs: min={cost.min().item():.4f}, mean={cost.mean().item():.4f}, max={cost.max().item():.4f}, std={cost.std().item():.4f}")
+
+
+
+
         return cost

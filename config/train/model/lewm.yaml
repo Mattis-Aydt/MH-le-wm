@@ -8,18 +8,27 @@ encoder:
   pretrained: false
   use_mask_token: false
 
-predictor:
-  _target_: module.ARPredictor
+state_transformer:
+  _target_: module.StateTransformer
   num_frames: ${history_size}
   input_dim: ${embed_dim}
   hidden_dim: ${embed_dim}
   output_dim: ${embed_dim}
-  depth: 6
+  depth: 5
   heads: 16
-  mlp_dim: 2048
+  mlp_dim: 512
   dim_head: 64
   dropout: 0.1
   emb_dropout: 0.0
+
+predictor:
+  _target_: module.Predictor
+  state_dim: ${embed_dim}
+  action_dim: ${embed_dim}
+  hidden_dim: 1024
+  output_dim: ${embed_dim}
+  depth: 6
+  dropout: 0.1
 
 action_encoder:
   _target_: module.Embedder
@@ -27,15 +36,6 @@ action_encoder:
   emb_dim: ${embed_dim}
 
 projector:
-  _target_: module.MLP
-  input_dim: ${embed_dim}
-  output_dim: ${embed_dim}
-  hidden_dim: 2048
-  norm_fn:
-    _target_: torch.nn.BatchNorm1d
-    _partial_: true
-
-pred_proj:
   _target_: module.MLP
   input_dim: ${embed_dim}
   output_dim: ${embed_dim}

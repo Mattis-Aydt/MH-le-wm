@@ -4,12 +4,3 @@
 defaults:
   - override /hydra/launcher: basic
 
-wandb:
-  enabled: False
-  config:
-    entity: lewm
-    project: lewm
-    name: ${output_model_name}
-    id: ${subdir}
-    resume: allow
-    log_model: False

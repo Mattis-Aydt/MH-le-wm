@@ -16,16 +16,16 @@ dataset:
     - state
 
 seed: 42
-policy: random # ckpt name or random
+policy: lewm
 
 plan_config:
   horizon: 5
-  receding_horizon: 5
+  receding_horizon: 1
   action_block: 5 # frameskip
 
 # evaluation from dataset (replay expert trajectories)
 eval:
-  num_eval: 50
+  num_eval: 10
   goal_offset_steps: 25
   eval_budget: 50
   img_size: 224

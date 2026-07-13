@@ -239,10 +239,10 @@ class MLP(nn.Module):
         x: (B*T, D)
         """
         return self.net(x)
+    
 
-
-class ARPredictor(nn.Module):
-    """Autoregressive predictor for next-step embedding prediction."""
+class StateTransformer(nn.Module):
+    """Causal transformer for encoding a window of latent states into a temporal state."""
 
     def __init__(
         self,
@@ -270,16 +270,57 @@ class ARPredictor(nn.Module):
             dim_head,
             mlp_dim,
             dropout,
-            block_class=ConditionalBlock,
+            block_class=Block,  # <-- standard block, no action conditioning
         )
 
-    def forward(self, x, c):
+    def forward(self, x):
         """
-        x: (B, T, d)
-        c: (B, T, act_dim)
+        x: (B, H, D)  -- window of latent image embeddings
+        Returns: (B, H, D)  -- transformed sequence, caller takes [:, -1, :]
         """
-        T = x.size(1)
-        x = x + self.pos_embedding[:, :T]
+        H = x.size(1)
+        x = x + self.pos_embedding[:, :H]
         x = self.dropout(x)
-        x = self.transformer(x, c)
+        x = self.transformer(x)  # no conditioning argument
         return x
+
+class Predictor(nn.Module):
+    """Fully-connected predictor for next-state embedding prediction."""
+
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim,
+        output_dim,
+        depth=2,
+        dropout=0.0,
+    ):
+        super().__init__()
+        input_dim = state_dim + action_dim
+        layers = []
+
+        # first layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.GELU())
+        layers.append(nn.Dropout(dropout))
+
+        # hidden layers
+        for _ in range(depth - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+
+        # output layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        x: (B, state_dim + action_dim) -- concatenated state and action
+        Returns: (B, output_dim) -- predicted next state
+        """
+        return self.net(x)

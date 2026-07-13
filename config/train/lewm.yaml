@@ -7,12 +7,13 @@ defaults:
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
-num_workers: 6
+num_workers: 2
 train_split: 0.9
 seed: 3072
 img_size: 224
 embed_dim: 192
 history_size: 3
+chunk_size: 128
 
 trainer:
   max_epochs: 100
@@ -22,7 +23,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
+  batch_size: 64
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
@@ -41,3 +42,8 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+      
+wandb:
+  enabled: True
+  config:
+    project: lewm-state-embeddings
