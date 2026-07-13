@@ -108,10 +108,9 @@ def run(cfg):
     run_id = cfg.get("subdir") or ""
     run_dir = Path(swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id)
 
-    logger = None
-    if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+    logger = WandbLogger(**cfg.wandb.config)
+
+
 
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w") as f:
