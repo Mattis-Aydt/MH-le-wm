@@ -1,13 +1,18 @@
 dataset:
-  num_steps: ${eval:'${num_preds} + ${history_size}'}
+  num_steps: 1
   frameskip: 5
   name: pusht_expert_train.lance
   keys_to_load:
     - pixels
     - action
-    - proprio
-    - state
   keys_to_cache:
     - action
-    - proprio
-    - state
+
+data_sampling:
+  max_interval_sum: 200
+  pool_ceiling_multiplier: 50
+  interval_dist_p: 0.5
+  num_pools: 20
+  batch_size: ${loader.batch_size}
+  seed: ${seed}
+  stride: 4

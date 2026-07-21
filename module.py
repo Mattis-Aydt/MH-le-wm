@@ -241,8 +241,75 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class ActionChunkEncoder(nn.Module):
+    """Encodes a variable-length sequence of per-step action embeddings 
+    into a single action chunk latent with explicit horizon embedding."""
+
+    def __init__(
+        self,
+        emb_dim,
+        depth=2,
+        heads=4,
+        mlp_dim=512,
+        dim_head=64,
+        dropout=0.0,
+        max_horizon=50,
+    ):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.max_horizon = max_horizon
+        
+        # Horizon embedding table
+        self.horizon_embed = nn.Embedding(max_horizon + 1, emb_dim)
+        
+        # Causal Transformer over per-step action embeddings
+        self.transformer = Transformer(
+            input_dim=emb_dim,
+            hidden_dim=emb_dim,
+            output_dim=emb_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            block_class=Block,
+        )
+        
+        self.output_norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, act_emb):
+        """
+        act_emb: (B, L, emb_dim) — per-step action embeddings
+        
+        Returns: (B, 1, emb_dim) — single chunk latent per sample
+        """
+        B, L, D = act_emb.shape
+        
+        # Causal Transformer over action sequence
+        chunk_latent = self.transformer(act_emb)  # (B, L, emb_dim)
+        
+        # Take the last token as the chunk summary
+        chunk_latent = chunk_latent[:, -1:, :]  # (B, 1, emb_dim)
+        chunk_latent = self.output_norm(chunk_latent)
+        
+        # Add horizon embedding
+        horizon_clamped = min(L, self.max_horizon)
+        h_embed = self.horizon_embed(
+            torch.tensor(horizon_clamped, device=act_emb.device)
+        )  # (emb_dim,)
+        h_embed = h_embed.unsqueeze(0).unsqueeze(0)  # (1, 1, emb_dim)
+        
+        chunk_latent = chunk_latent + h_embed
+        
+        return chunk_latent
+
+
 class ARPredictor(nn.Module):
-    """Autoregressive predictor for next-step embedding prediction."""
+    """Autoregressive predictor for next-step embedding prediction.
+    
+    No longer has built-in positional embeddings — time/horizon embeddings
+    are added by the caller (JEPA) before calling forward.
+    """
 
     def __init__(
         self,
@@ -259,7 +326,8 @@ class ARPredictor(nn.Module):
         emb_dropout=0.0,
     ):
         super().__init__()
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        # num_frames kept for config compatibility but not used for pos_embed
+        self.num_frames = num_frames
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(
             input_dim,
@@ -275,11 +343,9 @@ class ARPredictor(nn.Module):
 
     def forward(self, x, c):
         """
-        x: (B, T, d)
-        c: (B, T, act_dim)
+        x: (B, T, d) — image embeddings with time embeddings already added
+        c: (B, T, act_dim) — action chunk latents with horizon embeddings already added
         """
-        T = x.size(1)
-        x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x

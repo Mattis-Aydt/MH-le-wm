@@ -4,9 +4,6 @@ defaults:
   - data: pusht
   - model: lewm
 
-wandb:
-  config:
-    project: lewm-original-test
 
 output_model_name: lewm
 subdir: ${hydra:job.id}
@@ -19,7 +16,7 @@ embed_dim: 192
 history_size: 3
 
 trainer:
-  max_epochs: 100
+  max_epochs: 20
   devices: auto
   accelerator: gpu
   precision: bf16
@@ -37,6 +34,11 @@ optimizer:
   lr: 5e-5
   weight_decay: 1e-3
 
+scheduler:
+  type: LinearWarmupCosineAnnealingLR
+  warmup_steps: 1000
+  max_steps: 100000
+
 num_preds: 1
 
 loss:
@@ -46,4 +48,8 @@ loss:
       knots: 17
       num_proj: 1024
 
+wandb:
+  enabled: True
+  config:
+    project: lewm-variable-horizon
 

@@ -26,6 +26,21 @@ action_encoder:
   input_dim: ???
   emb_dim: ${embed_dim}
 
+action_chunk_encoder:
+  _target_: module.ActionChunkEncoder
+  emb_dim: ${embed_dim}
+  depth: 4
+  heads: 8
+  mlp_dim: 1024
+  dim_head: 64
+  dropout: 0.0
+  max_horizon: 200
+
+time_embed:
+  _target_: torch.nn.Embedding
+  num_embeddings: 201
+  embedding_dim: ${embed_dim}
+
 projector:
   _target_: module.MLP
   input_dim: ${embed_dim}
