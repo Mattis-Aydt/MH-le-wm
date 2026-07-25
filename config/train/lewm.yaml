@@ -7,7 +7,7 @@ defaults:
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
-num_workers: 6
+num_workers: 2
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -22,7 +22,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
+  batch_size: 80
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
@@ -41,3 +41,16 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+
+data:
+  windows_per_episode_factor: 10.0   # 4× total data vs original
+  val_windows_per_episode_factor: 1.0
+  geometric_p: 0.25                   # 25% short, 75% variable
+  max_gap: 50
+  buffer_size: 500
+
+wandb:
+  enabled: True
+  config:
+    project: variable-masked-horizon

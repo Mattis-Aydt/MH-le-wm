@@ -11,6 +11,7 @@ encoder:
 predictor:
   _target_: module.ARPredictor
   num_frames: ${history_size}
+  max_time: 500
   input_dim: ${embed_dim}
   hidden_dim: ${embed_dim}
   output_dim: ${embed_dim}
@@ -23,8 +24,18 @@ predictor:
 
 action_encoder:
   _target_: module.Embedder
-  input_dim: ???
+  input_dim: 10
   emb_dim: ${embed_dim}
+
+action_chunk_encoder:
+  _target_: module.ActionChunkEncoder
+  emb_dim: ${embed_dim}
+  depth: 2
+  heads: 4
+  mlp_dim: 512
+  dim_head: 64
+  dropout: 0.0
+  max_horizon: 50
 
 projector:
   _target_: module.MLP

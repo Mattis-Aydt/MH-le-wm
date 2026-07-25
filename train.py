@@ -10,6 +10,7 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+from dataset import VariableHorizonDataset, variable_horizon_collate
 from module import SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
@@ -21,28 +22,34 @@ def lejepa_forward(self, batch, stage, cfg):
     n_preds = cfg.num_preds
     lambd = cfg.loss.sigreg.weight
 
-    # Replace NaN values with 0 (occurs at sequence boundaries)
-    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-
     output = self.model.encode(batch)
 
     emb = output["emb"]  # (B, T, D)
-    act_emb = output["act_emb"]
+    act_emb = output["act_emb"]  # (B, T-1, D)
 
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, : ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
 
-    tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    tgt_emb = emb[:, n_preds:]
 
-    # LeWM loss
+    # time_ids shape: (B, T) where T = num_steps
+    # predictor needs T+1 times for T positions, so slice ctx_len+1
+    time_ids = batch.get("time_ids")
+    if time_ids is not None:
+        pred_time_ids = time_ids[:, : ctx_len + 1]
+    else:
+        pred_time_ids = None
+
+    pred_emb = self.model.predict(ctx_emb, ctx_act, time_ids=pred_time_ids)
+
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
+
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
@@ -53,31 +60,85 @@ def run(cfg):
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
-    dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
-    )
+
+    from stable_worldmodel.data.utils import get_cache_dir, _resolve_dataset
+    datasets_dir = get_cache_dir(cache_dir, sub_folder='datasets')
+    lance_path = os.path.abspath(_resolve_dataset(dataset_name, datasets_dir))
+
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
+
+    # Create dataset (transform=None for now, set after normalizers)
+    dataset = VariableHorizonDataset(
+        lance_path=lance_path,
+        num_steps=cfg.data.dataset.num_steps,
+        windows_per_episode_factor=cfg.data.get("windows_per_episode_factor", 1.0),
+        max_gap=cfg.data.get("max_gap", 50),
+        geometric_p=cfg.data.get("geometric_p", 0.5),
+        buffer_size=cfg.data.get("buffer_size", 2000),
+        frameskip=cfg.data.dataset.frameskip,
+    )
+
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
-
-        cfg.model.action_encoder.input_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
+        cfg.model.action_encoder.input_dim = dataset.get_dim("action")
 
     transform = spt.data.transforms.Compose(*transforms)
     dataset.transform = transform
+    dataset._col_cache.clear()
 
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+    # Split by episode indices instead of random_split
+    total_episodes = dataset.num_episodes
+    n_train = int(total_episodes * cfg.train_split)
+
+    train_dataset = VariableHorizonDataset(
+        lance_path=lance_path,
+        num_steps=cfg.data.dataset.num_steps,
+        windows_per_episode_factor=cfg.data.get("windows_per_episode_factor", 1.0),
+        max_gap=cfg.data.get("max_gap", 50),
+        geometric_p=cfg.data.get("geometric_p", 0.5),
+        buffer_size=cfg.data.get("buffer_size", 2000),
+        frameskip=cfg.data.dataset.frameskip,
+        transform=transform,
+    )
+    train_dataset.episode_order = list(range(n_train))
+
+    val_dataset = VariableHorizonDataset(
+        lance_path=lance_path,
+        num_steps=cfg.data.dataset.num_steps,
+        windows_per_episode_factor=cfg.data.get("val_windows_per_episode_factor", 0.2),
+        max_gap=cfg.data.get("max_gap", 50),
+        geometric_p=cfg.data.get("geometric_p", 0.5),
+        buffer_size=cfg.data.get("buffer_size", 2000),
+        frameskip=cfg.data.dataset.frameskip,
+        transform=transform,
+    )
+    val_dataset.episode_order = list(range(n_train, total_episodes))
+
+    train = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=cfg.loader.batch_size,
+        num_workers=cfg.num_workers,
+        collate_fn=variable_horizon_collate,
+        persistent_workers=False,
+        prefetch_factor=cfg.loader.get("prefetch_factor", 3) if cfg.num_workers > 0 else None,
+        pin_memory=cfg.loader.get("pin_memory", True),
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
+    )
+    val = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=cfg.loader.batch_size,
+        num_workers=cfg.num_workers,
+        collate_fn=variable_horizon_collate,
+        persistent_workers=False,
+        prefetch_factor=cfg.loader.get("prefetch_factor", 3) if cfg.num_workers > 0 else None,
+        pin_memory=cfg.loader.get("pin_memory", True),
+        multiprocessing_context="spawn" if cfg.num_workers > 0 else None,
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
-    
     ##############################
     ##       model / optim      ##
     ##############################
@@ -139,7 +200,6 @@ def run(cfg):
 
     manager()
     return
-
 
 if __name__ == "__main__":
     run()
