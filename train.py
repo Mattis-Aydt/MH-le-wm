@@ -14,6 +14,8 @@ from dataset import VariableHorizonDataset, variable_horizon_collate
 from module import SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
+import torch.nn.functional as F
+
 
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
@@ -26,6 +28,17 @@ def lejepa_forward(self, batch, stage, cfg):
 
     emb = output["emb"]  # (B, T, D)
     act_emb = output["act_emb"]  # (B, T-1, D)
+
+    # === Collapse detection: pairwise cosine similarity of chunk latents ===
+    # Healthy: ~0.0-0.3 (diverse). Collapse: → 1.0 (all identical).
+    if act_emb is not None and act_emb.numel() > 0:
+        B, T, D = act_emb.shape
+        if B * T > 1:
+            flat = F.normalize(act_emb.reshape(-1, D), dim=-1)
+            sim = flat @ flat.t()
+            mask = torch.triu(torch.ones_like(sim), diagonal=1).bool()
+            if mask.any():
+                self.log(f"{stage}/act_emb_cos_sim", sim[mask].mean().detach(), on_step=True, sync_dist=True)
 
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
