@@ -45,7 +45,6 @@ frozenlist==1.8.0
 fsspec==2026.4.0
 gitdb==4.0.12
 GitPython==3.1.50
-gym @ file:///tmp/gym_src/gym-0.21.0
 h11==0.16.0
 hf-xet==1.5.0
 httpcore==1.0.9
