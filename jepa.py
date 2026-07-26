@@ -84,6 +84,7 @@ class JEPA(nn.Module):
         """
         N, T, _ = act.shape
         a = self.action_embedder(act)  # (N, T, emb_dim)
+        a = a.reshape(N * T, 1, -1)  # each action is its own length-1 chunk
         lengths = torch.ones(N * T, dtype=torch.long, device=act.device)
         c = self.action_chunk_encoder(a, lengths=lengths)  # (N*T, 1, emb_dim)
         return c.view(N, T, -1)
@@ -91,7 +92,8 @@ class JEPA(nn.Module):
     def rollout(self, info, action_sequence, history_size: int = 3):
         """Rollout the model given an initial info dict and action sequence.
 
-        pixels: (B, 1, H, C, H, W) — H history frames (H = history_size)
+        pixels: (B, 1, H, C, H, W) — H history frames as provided by the
+            policy (H may be smaller than history_size; the window grows)
         action_sequence: (B, S, T, action_dim) — S CEM plan samples,
             first H entries are history actions, rest are future actions.
 
@@ -121,25 +123,28 @@ class JEPA(nn.Module):
         HS = history_size
         device = emb.device
 
-        # Window-relative time ids, matching training: first context token is
-        # always time 0, horizons all 1 (gap=1 regime). Same ids every step.
-        _ids = torch.arange(0, HS + 1, device=device).unsqueeze(0)  # (1, HS+1)
+        def _predict_next(emb, act_emb_all):
+            """One autoregressive step with a growing window.
 
-        def _time_ids():
-            return _ids.expand(emb.size(0), -1)  # (B*S, HS+1)
+            Window length k = min(HS, current obs count) — mirrors the
+            original rollout (the policy provides only H=2 history frames,
+            so the window grows 2 -> 3). Window-relative time ids [0..k]
+            with all horizons = 1 (gap=1 regime), matching training.
+            """
+            k = min(HS, emb.size(1))
+            emb_trunc = emb[:, -k:]
+            act_trunc = act_emb_all[:, emb.size(1) - k : emb.size(1)]
+            ids = torch.arange(0, k + 1, device=device)
+            ids = ids.unsqueeze(0).expand(emb.size(0), -1)  # (B*S, k+1)
+            pred = self.predict(emb_trunc, act_trunc, time_ids=ids)[:, -1:]
+            return torch.cat([emb, pred], dim=1)
 
         # ---- autoregressive rollout: predict only ----
         for t in range(n_steps):
-            emb_trunc = emb[:, -HS:]  # (B*S, HS, D)
-            act_trunc = act_emb_all[:, t : t + HS]  # chunks for transitions t..t+HS-1
-            pred_emb = self.predict(emb_trunc, act_trunc, time_ids=_time_ids())[:, -1:]
-            emb = torch.cat([emb, pred_emb], dim=1)
+            emb = _predict_next(emb, act_emb_all)
 
         # predict the final state
-        emb_trunc = emb[:, -HS:]
-        act_trunc = act_emb_all[:, n_steps : n_steps + HS]
-        pred_emb = self.predict(emb_trunc, act_trunc, time_ids=_time_ids())[:, -1:]
-        emb = torch.cat([emb, pred_emb], dim=1)
+        emb = _predict_next(emb, act_emb_all)
 
         # unflatten batch and sample dimensions
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
