@@ -50,6 +50,7 @@ def lejepa_forward(self, batch, stage, cfg):
     time_ids = batch.get("time_ids")
     if time_ids is not None:
         pred_time_ids = time_ids[:, : ctx_len + 1]
+        pred_time_ids = pred_time_ids - pred_time_ids[:, :1]  # window-relative: first context = 0
     else:
         pred_time_ids = None
 

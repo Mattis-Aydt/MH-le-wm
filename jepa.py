@@ -74,42 +74,74 @@ class JEPA(nn.Module):
     ## Inference only ##
     ####################
 
+    def _encode_unit_chunks(self, act):
+        """Encode (N, T, action_dim) bundled actions as length-1 chunks.
+
+        Every action is an independent batch element for the chunk encoder
+        (never merged across chunks). Eval uses fixed gap=1, so each bundled
+        action IS a complete chunk — matching the gap=1 training regime.
+        Returns chunk latents (N, T, emb_dim).
+        """
+        N, T, _ = act.shape
+        a = self.action_embedder(act)  # (N, T, emb_dim)
+        lengths = torch.ones(N * T, dtype=torch.long, device=act.device)
+        c = self.action_chunk_encoder(a, lengths=lengths)  # (N*T, 1, emb_dim)
+        return c.view(N, T, -1)
+
     def rollout(self, info, action_sequence, history_size: int = 3):
-        """Rollout the model given an initial info dict and action sequence."""
+        """Rollout the model given an initial info dict and action sequence.
+
+        pixels: (B, 1, H, C, H, W) — H history frames (H = history_size)
+        action_sequence: (B, S, T, action_dim) — S CEM plan samples,
+            first H entries are history actions, rest are future actions.
+
+        Fixed-horizon (gap=1) rollout:
+        - encode() ONCE for the history frames
+        - all actions chunk-encoded ONCE upfront (unit chunks)
+        - the loop only calls predict() autoregressively
+        - time_ids are consecutive so every horizon = 1 (gap=1 regime)
+        """
 
         assert "pixels" in info, "pixels not in info_dict"
-        H = info["pixels"].size(2)
+        H = info["pixels"].size(2)  # number of history frames (= history_size)
         B, S, T = action_sequence.shape[:3]
-        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
-        info["action"] = act_0
         n_steps = T - H
 
+        # ---- one-time encode of history frames ----
         _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
-        _init = self.encode(_init)
-        emb = info["emb"] = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
-        _init = {k: detach_clone(v) for k, v in _init.items()}
+        _init.pop("action", None)  # actions are encoded separately below
+        _init = self.encode(_init)  # emb: (B, H, D)
+        emb = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()  # (B*S, H, D)
 
-        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
-        act = rearrange(act_0, "b s ... -> (b s) ...")
-        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+        # ---- one-time encode of ALL actions (history + future) ----
+        act_all = rearrange(action_sequence, "b s ... -> (b s) ...")  # (B*S, T, adim)
+        act_emb_all = self._encode_unit_chunks(act_all)  # (B*S, T, D)
 
         HS = history_size
+        device = emb.device
+
+        # Window-relative time ids, matching training: first context token is
+        # always time 0, horizons all 1 (gap=1 regime). Same ids every step.
+        _ids = torch.arange(0, HS + 1, device=device).unsqueeze(0)  # (1, HS+1)
+
+        def _time_ids():
+            return _ids.expand(emb.size(0), -1)  # (B*S, HS+1)
+
+        # ---- autoregressive rollout: predict only ----
         for t in range(n_steps):
-            act_emb = self.action_embedder(act)
-            emb_trunc = emb[:, -HS:]
-            act_trunc = act_emb[:, -HS:]
-            pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+            emb_trunc = emb[:, -HS:]  # (B*S, HS, D)
+            act_trunc = act_emb_all[:, t : t + HS]  # chunks for transitions t..t+HS-1
+            pred_emb = self.predict(emb_trunc, act_trunc, time_ids=_time_ids())[:, -1:]
             emb = torch.cat([emb, pred_emb], dim=1)
 
-            next_act = act_future[:, t : t + 1, :]
-            act = torch.cat([act, next_act], dim=1)
-
-        act_emb = self.action_embedder(act)
+        # predict the final state
         emb_trunc = emb[:, -HS:]
-        act_trunc = act_emb[:, -HS:]
-        pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]
+        act_trunc = act_emb_all[:, n_steps : n_steps + HS]
+        pred_emb = self.predict(emb_trunc, act_trunc, time_ids=_time_ids())[:, -1:]
         emb = torch.cat([emb, pred_emb], dim=1)
 
+        # unflatten batch and sample dimensions
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
         info["predicted_emb"] = pred_rollout
 
