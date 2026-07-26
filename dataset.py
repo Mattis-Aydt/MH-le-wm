@@ -20,11 +20,16 @@ def decode_jpeg_bytes(jpeg_bytes):
 class VariableHorizonDataset(IterableDataset):
     """Variable-horizon window dataset over a Lance file.
 
-    Key property: Lance is only ever read SEQUENTIALLY, one full episode
-    at a time. All windows of that episode are decoded immediately
-    (while the episode data is hot) and the shuffle buffer stores the
-    actual samples, not metadata. Random pops from the buffer therefore
-    never trigger a Lance read.
+    Key properties:
+    - Lance is only ever read SEQUENTIALLY, one full episode at a time.
+      All windows of that episode are decoded immediately (while the data
+      is hot) and the shuffle buffer stores actual samples, not metadata.
+    - Phase-offset sampling: each window draws a phase p in [0, frameskip-1]
+      and starts at raw frame start*frameskip + p. Action bundles are
+      relative to the phase. This matches the original le-wm sampling,
+      which allowed window starts at ANY raw frame (~5x more distinct
+      windows per episode than bundle-aligned starts).
+    - time_ids stay in BUNDLED units; train.py makes them window-relative.
     """
 
     def __init__(
@@ -77,7 +82,7 @@ class VariableHorizonDataset(IterableDataset):
         self.num_episodes = len(starts)
 
     def _load_episode(self, episode_idx):
-        """Single sequential read of one full episode."""
+        """Single sequential read of one full episode. Returns RAW actions."""
         ds = self._get_ds()
         start = self.episode_starts[episode_idx]
         length = self.episode_lengths[episode_idx]
@@ -85,18 +90,12 @@ class VariableHorizonDataset(IterableDataset):
         scanner = ds.scanner(offset=start, limit=length)
         table = scanner.to_table()
 
-        raw_actions = np.stack(table["action"].to_numpy())
+        raw_actions = np.stack(table["action"].to_numpy())  # (T_raw, 2)
         pixels = table["pixels"].to_numpy()
         proprio = np.stack(table["proprio"].to_numpy()) if "proprio" in table.column_names else None
         state = np.stack(table["state"].to_numpy()) if "state" in table.column_names else None
 
-        n = len(raw_actions) // self.frameskip
-        if n == 0:
-            bundled_actions = np.zeros((1, self.frameskip * 2), dtype=np.float32)
-        else:
-            bundled_actions = raw_actions[:n * self.frameskip].reshape(n, self.frameskip * 2)
-
-        return bundled_actions, pixels, proprio, state
+        return raw_actions, pixels, proprio, state
 
     # ---------------- normalizer interface ----------------
 
@@ -128,7 +127,7 @@ class VariableHorizonDataset(IterableDataset):
         return gaps
 
     def _sample_window_params(self, episode_idx):
-        """Draw (start_offset, gaps) tuples for one episode."""
+        """Draw (start_offset, gaps, phase) tuples for one episode."""
         bundled_len = self.episode_lengths[episode_idx] // self.frameskip
         n_windows = max(1, int(bundled_len * self.windows_per_episode_factor))
         params = []
@@ -138,28 +137,35 @@ class VariableHorizonDataset(IterableDataset):
             if total_span >= bundled_len:
                 continue
             start_offset = random.randint(0, bundled_len - total_span - 1)
-            params.append((start_offset, gaps))
+            phase = random.randint(0, self.frameskip - 1)
+            params.append((start_offset, gaps, phase))
         return params
 
-    def _materialize_window(self, ep_data, start_offset, gaps):
+    def _materialize_window(self, ep_data, start_offset, gaps, phase):
         """Decode + transform one window from already-loaded episode data."""
-        bundled_actions, pixels, proprio, state = ep_data
+        raw_actions, pixels, proprio, state = ep_data
 
+        # bundled-unit time ids (train.py makes them window-relative)
         time_ids = [start_offset]
         for g in gaps:
             time_ids.append(time_ids[-1] + g)
         time_ids = np.array(time_ids, dtype=np.int64)
 
-        raw_time_ids = time_ids * self.frameskip
+        # raw frame indices of the observations, phase-shifted
+        raw_obs_ids = time_ids * self.frameskip + phase
 
-        obs_pixels = [decode_jpeg_bytes(pixels[t]) for t in raw_time_ids]
+        obs_pixels = [decode_jpeg_bytes(pixels[t]) for t in raw_obs_ids]
         obs_pixels = torch.stack(obs_pixels)
 
-        obs_proprio = proprio[raw_time_ids] if proprio is not None else None
-        obs_state = state[raw_time_ids] if state is not None else None
+        obs_proprio = proprio[raw_obs_ids] if proprio is not None else None
+        obs_state = state[raw_obs_ids] if state is not None else None
 
-        all_bundled = bundled_actions[time_ids[0]:time_ids[-1]]
-        all_bundled = torch.from_numpy(all_bundled).float()
+        # raw actions spanning the whole window, bundled relative to phase:
+        # raw_obs_ids[-1] - raw_obs_ids[0] = span * frameskip, divisible by frameskip
+        flat = raw_actions[raw_obs_ids[0]:raw_obs_ids[-1]]  # (span*frameskip, 2)
+        all_bundled = torch.from_numpy(
+            flat.reshape(-1, self.frameskip * 2)
+        ).float()  # (span, frameskip*2)
 
         chunk_boundaries = []
         for i in range(self.num_gaps):
@@ -220,9 +226,9 @@ class VariableHorizonDataset(IterableDataset):
             ep_data = self._load_episode(episode_idx)
 
             random.shuffle(params)
-            for start_offset, gaps in params:
+            for start_offset, gaps, phase in params:
                 # Decode while the episode is hot; buffer stores the SAMPLE
-                buffer.append(self._materialize_window(ep_data, start_offset, gaps))
+                buffer.append(self._materialize_window(ep_data, start_offset, gaps, phase))
                 if len(buffer) >= self.buffer_size:
                     idx = random.randint(0, len(buffer) - 1)
                     yield buffer.pop(idx)
