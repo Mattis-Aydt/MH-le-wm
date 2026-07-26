@@ -56,13 +56,26 @@ def lejepa_forward(self, batch, stage, cfg):
 
     pred_emb = self.model.predict(ctx_emb, ctx_act, time_ids=pred_time_ids)
 
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+    # per-sample prediction loss (B,) — training loss is still the plain mean
+    per_sample = (pred_emb - tgt_emb).pow(2).mean(dim=(1, 2))
+    output["pred_loss"] = per_sample.mean()
+
+    # === horizon-split logging (LOGGING ONLY — not used for training) ===
+    if time_ids is not None:
+        gaps = time_ids[:, 1:] - time_ids[:, :-1]  # (B, T-1) absolute gaps
+        short = (gaps == 1).all(dim=1)
+        if short.any():
+            self.log(f"{stage}/pred_loss_gap1", per_sample[short].mean().detach(), on_step=True)
+        if (~short).any():
+            self.log(f"{stage}/pred_loss_multistep", per_sample[~short].mean().detach(), on_step=True)
+
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
+
 
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
