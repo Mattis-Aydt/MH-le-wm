@@ -103,6 +103,8 @@ def run(cfg):
         geometric_p=cfg.data.get("geometric_p", 0.5),
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
+        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
+        fixed_gap=cfg.data.get("fixed_gap", 1),
     )
 
     with open_dict(cfg):
@@ -130,6 +132,8 @@ def run(cfg):
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
         transform=transform,
+        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
+        fixed_gap=cfg.data.get("fixed_gap", 1),
     )
     train_dataset.episode_order = list(range(n_train))
 
@@ -142,6 +146,8 @@ def run(cfg):
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
         transform=transform,
+        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
+        fixed_gap=cfg.data.get("fixed_gap", 1),
     )
     val_dataset.episode_order = list(range(n_train, total_episodes))
 

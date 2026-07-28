@@ -82,6 +82,7 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     # -- run evaluation
+    cost_log = []  # one (goal_keys, costs) entry per CEM replan call
     policy = cfg.get("policy", "random")
 
     if policy != "random":
@@ -92,6 +93,21 @@ def run(cfg: DictConfig):
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
+
+        # -- log CEM costs per replan (wrapper only, package untouched) --
+        _orig_solve = solver.solve
+
+        def _logged_solve(info_dict, init_action=None):
+            out = _orig_solve(info_dict, init_action=init_action)
+            key = info_dict.get("goal_proprio", info_dict.get("goal_state"))
+            if torch.is_tensor(key):
+                key = key.detach().cpu().numpy()
+            key = np.asarray(key, dtype=np.float64).reshape(len(key), -1)
+            cost_log.append((key, np.asarray(out["costs"], dtype=np.float64)))
+            return out
+
+        solver.solve = _logged_solve
+
         policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
@@ -151,8 +167,53 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-    
+
     print(metrics)
+
+    # -- per-episode report --
+    successes = np.asarray(metrics["episode_successes"], dtype=bool)
+    n = len(successes)
+    cost_p1 = np.full(n, np.nan)
+    cost_p2 = np.full(n, np.nan)
+
+    if cost_log:
+        keys0, cost_p1[:] = cost_log[0]
+        assert len(keys0) == n, "first replan should cover all envs"
+        for keys_k, costs_k in cost_log[1:]:
+            d = ((keys_k[:, None, :] - keys0[None, :, :]) ** 2).sum(-1)
+            match = d.argmin(1)
+            if d.min(1).max() > 1e-8:
+                print("WARNING: inexact goal-key match in cost log")
+            cost_p2[match] = costs_k
+
+    report_lines = []
+    for i in range(n):
+        s = "SUCCESS" if successes[i] else "FAIL   "
+        c1 = f"{cost_p1[i]:.3f}" if not np.isnan(cost_p1[i]) else " — "
+        c2 = f"{cost_p2[i]:.3f}" if not np.isnan(cost_p2[i]) else " — "
+        report_lines.append(
+            f"ep {i:03d} | {s} | cost_plan1={c1} | cost_plan2={c2} "
+            f"| dataset_ep={eval_episodes[i]} | video=env_{i}.mp4"
+        )
+    report = "\n".join(report_lines)
+    print(report)
+
+    early = successes & np.isnan(cost_p2)   # done before t=25
+    late = successes & ~np.isnan(cost_p2)
+    fail = ~successes
+
+    def _stat(a):
+        a = a[~np.isnan(a)]
+        return f"mean={a.mean():.3f} median={np.median(a):.3f} (n={len(a)})" if len(a) else "n/a"
+
+    summary = "\n".join([
+        f"success before 2nd replan: {early.sum()}",
+        f"success after 2nd replan:  {late.sum()}",
+        f"failures:                  {fail.sum()}",
+        f"cost_plan2 | late success: {_stat(cost_p2[late])}",
+        f"cost_plan2 | failures:     {_stat(cost_p2[fail])}",
+    ])
+    print(summary)
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +227,8 @@ def run(cfg: DictConfig):
 
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
+        f.write(f"per-episode:\n{report}\n")
+        f.write(f"summary:\n{summary}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
 

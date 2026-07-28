@@ -39,6 +39,9 @@ class VariableHorizonDataset(IterableDataset):
         windows_per_episode_factor: float = 1.0,
         max_gap: int = 50,
         geometric_p: float = 0.5,
+        gap_sampling: str = "geometric",   # geometric | fixed | uniform
+        fixed_gap: int = 1,
+
         buffer_size: int = 1000,
         frameskip: int = 5,
         transform: Optional[callable] = None,
@@ -50,6 +53,9 @@ class VariableHorizonDataset(IterableDataset):
         self.windows_per_episode_factor = windows_per_episode_factor
         self.max_gap = max_gap
         self.geometric_p = geometric_p
+        self.gap_sampling = gap_sampling
+        self.fixed_gap = fixed_gap
+
         self.buffer_size = buffer_size
         self.frameskip = frameskip
         self.transform = transform
@@ -122,6 +128,11 @@ class VariableHorizonDataset(IterableDataset):
     # ---------------- window sampling ----------------
 
     def _sample_gaps(self):
+        if self.gap_sampling == "fixed":
+            return np.full(self.num_gaps, self.fixed_gap)
+        if self.gap_sampling == "uniform":
+            return np.random.randint(1, self.max_gap + 1, size=self.num_gaps)
+        # default: geometric (unchanged legacy behavior)
         gaps = np.random.geometric(self.geometric_p, size=self.num_gaps)
         gaps = np.clip(gaps, 1, self.max_gap)
         return gaps
