@@ -19,6 +19,7 @@ class JEPA(nn.Module):
         action_chunk_encoder,
         projector=None,
         pred_proj=None,
+        steps_per_chunk=1,
     ):
         super().__init__()
 
@@ -28,6 +29,7 @@ class JEPA(nn.Module):
         self.action_chunk_encoder = action_chunk_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.steps_per_chunk = steps_per_chunk
 
     def encode(self, info):
         """Encode observations and actions into embeddings."""
@@ -74,22 +76,23 @@ class JEPA(nn.Module):
     ## Inference only ##
     ####################
 
-    def _encode_unit_chunks(self, act):
-        """Encode (N, T, action_dim) bundled actions as length-1 chunks.
+    def _encode_chunks(self, act, chunk_len):
+        """Encode (N, T, action_dim) actions grouped into length-`chunk_len` chunks.
 
-        Every action is an independent batch element for the chunk encoder
-        (never merged across chunks). Eval uses fixed gap=1, so each bundled
-        action IS a complete chunk — matching the gap=1 training regime.
-        Returns chunk latents (N, T, emb_dim).
+        chunk_len=1 recovers unit chunks (each action its own chunk).
+        Returns chunk latents (N, T // chunk_len, emb_dim).
         """
         N, T, _ = act.shape
+        assert T % chunk_len == 0, f"T={T} not divisible by chunk_len={chunk_len}"
         a = self.action_embedder(act)  # (N, T, emb_dim)
-        a = a.reshape(N * T, 1, -1)  # each action is its own length-1 chunk
-        lengths = torch.ones(N * T, dtype=torch.long, device=act.device)
-        c = self.action_chunk_encoder(a, lengths=lengths)  # (N*T, 1, emb_dim)
-        return c.view(N, T, -1)
+        a = a.reshape(N * (T // chunk_len), chunk_len, -1)
+        lengths = torch.full(
+            (N * (T // chunk_len),), chunk_len, dtype=torch.long, device=act.device
+        )
+        c = self.action_chunk_encoder(a, lengths=lengths)  # (N*C, 1, emb_dim)
+        return c.view(N, T // chunk_len, -1)
 
-    def rollout(self, info, action_sequence, history_size: int = 3):
+    def rollout(self, info, action_sequence, history_size: int = 3, steps_per_chunk: int = None):
         """Rollout the model given an initial info dict and action sequence.
 
         pixels: (B, 1, H, C, H, W) — H history frames as provided by the
@@ -97,54 +100,73 @@ class JEPA(nn.Module):
         action_sequence: (B, S, T, action_dim) — S CEM plan samples,
             first H entries are history actions, rest are future actions.
 
-        Fixed-horizon (gap=1) rollout:
-        - encode() ONCE for the history frames
-        - all actions chunk-encoded ONCE upfront (unit chunks)
-        - the loop only calls predict() autoregressively
-        - time_ids are consecutive so every horizon = 1 (gap=1 regime)
+        steps_per_chunk (g): prediction jump per rollout step, in bundled
+            steps. g=1 recovers the gap=1 regime exactly; g=2 matches
+            models trained with fixed_gap=2.
+
+        Mechanics (single code path for all g):
+        - j0 = (H-1) % g: index of the oldest history frame that sits at
+          spacing g from the current frame. History is subsampled to
+          [j0, j0+g, ..., H-1] so context spacing matches training.
+        - actions from index j0 on are encoded ONCE as length-g chunks,
+          chunk-aligned with the subsampled frames (chunk j leaves obs j).
+        - the loop only calls predict() autoregressively; window-relative
+          time ids advance by g per step -> horizon_embed(g).
+        - encode() is called ONCE for the history frames.
         """
+        g = steps_per_chunk if steps_per_chunk is not None else self.steps_per_chunk
 
         assert "pixels" in info, "pixels not in info_dict"
-        H = info["pixels"].size(2)  # number of history frames (= history_size)
+        H = info["pixels"].size(2)  # number of history frames provided
         B, S, T = action_sequence.shape[:3]
-        n_steps = T - H
 
-        # ---- one-time encode of history frames ----
+        j0 = (H - 1) % g  # oldest history frame index at spacing g from current
+        n_act = T - j0    # actions from j0 onward (chunk-aligned)
+        assert n_act % g == 0, (
+            f"(T - j0)={n_act} not divisible by steps_per_chunk={g} "
+            f"(H={H}, T={T}) — adjust plan horizon"
+        )
+        C = n_act // g                    # total chunks (history + future)
+        M = (H - 1 - j0) // g + 1         # kept history frames
+        assert C >= M, f"not enough actions (C={C}) for history (M={M})"
+
+        # ---- one-time encode of history frames, subsampled to spacing g ----
         _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
         _init.pop("action", None)  # actions are encoded separately below
-        _init = self.encode(_init)  # emb: (B, H, D)
+        _init["pixels"] = _init["pixels"][:, j0::g]  # (B, M, ...)
+        _init = self.encode(_init)  # emb: (B, M, D)
         emb = _init["emb"].unsqueeze(1).expand(B, S, -1, -1)
-        emb = rearrange(emb, "b s ... -> (b s) ...").clone()  # (B*S, H, D)
+        emb = rearrange(emb, "b s ... -> (b s) ...").clone()  # (B*S, M, D)
 
-        # ---- one-time encode of ALL actions (history + future) ----
+        # ---- one-time encode of ALL actions from j0 on, as length-g chunks ----
         act_all = rearrange(action_sequence, "b s ... -> (b s) ...")  # (B*S, T, adim)
-        act_emb_all = self._encode_unit_chunks(act_all)  # (B*S, T, D)
+        act_chunks = self._encode_chunks(act_all[:, j0:], g)  # (B*S, C, D)
 
         HS = history_size
         device = emb.device
 
-        def _predict_next(emb, act_emb_all):
+        def _predict_next(emb, act_chunks):
             """One autoregressive step with a growing window.
 
-            Window length k = min(HS, current obs count) — mirrors the
-            original rollout (the policy provides only H=2 history frames,
-            so the window grows 2 -> 3). Window-relative time ids [0..k]
-            with all horizons = 1 (gap=1 regime), matching training.
+            Window length k = min(HS, current obs count). Window-relative
+            time ids [0, g, ..., k*g] — all spacings and the prediction
+            horizon equal g, matching the fixed-gap training regime.
             """
             k = min(HS, emb.size(1))
             emb_trunc = emb[:, -k:]
-            act_trunc = act_emb_all[:, emb.size(1) - k : emb.size(1)]
-            ids = torch.arange(0, k + 1, device=device)
+            act_trunc = act_chunks[:, emb.size(1) - k : emb.size(1)]
+            ids = torch.arange(0, k + 1, device=device) * g
             ids = ids.unsqueeze(0).expand(emb.size(0), -1)  # (B*S, k+1)
             pred = self.predict(emb_trunc, act_trunc, time_ids=ids)[:, -1:]
             return torch.cat([emb, pred], dim=1)
 
         # ---- autoregressive rollout: predict only ----
-        for t in range(n_steps):
-            emb = _predict_next(emb, act_emb_all)
+        n_steps = C - M  # future predictions beyond the final one
+        for _ in range(n_steps):
+            emb = _predict_next(emb, act_chunks)
 
         # predict the final state
-        emb = _predict_next(emb, act_emb_all)
+        emb = _predict_next(emb, act_chunks)
 
         # unflatten batch and sample dimensions
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
@@ -182,7 +204,7 @@ class JEPA(nn.Module):
         goal = self.encode(goal)
 
         info_dict["goal_emb"] = goal["emb"]
-        info_dict = self.rollout(info_dict, action_candidates)
+        info_dict = self.rollout(info_dict, action_candidates, steps_per_chunk=self.steps_per_chunk)
 
         cost = self.criterion(info_dict)
         return cost
