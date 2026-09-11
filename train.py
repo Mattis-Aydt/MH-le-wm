@@ -84,6 +84,13 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
+
+    print("=" * 60)
+    print("FULL CONFIG:")
+    print("=" * 60)
+    print(OmegaConf.to_yaml(cfg, resolve=True))
+    print("=" * 60, flush=True)
+
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
@@ -98,13 +105,10 @@ def run(cfg):
     dataset = VariableHorizonDataset(
         lance_path=lance_path,
         num_steps=cfg.data.dataset.num_steps,
-        windows_per_episode_factor=cfg.data.get("windows_per_episode_factor", 1.0),
-        max_gap=cfg.data.get("max_gap", 50),
-        geometric_p=cfg.data.get("geometric_p", 0.5),
+        fixed_gaps=cfg.data.get("fixed_gaps", [1]),
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
-        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
-        fixed_gap=cfg.data.get("fixed_gap", 1),
+        # transform=transform,   # only on the train/val instances, not the stats one
     )
 
     with open_dict(cfg):
@@ -126,28 +130,20 @@ def run(cfg):
     train_dataset = VariableHorizonDataset(
         lance_path=lance_path,
         num_steps=cfg.data.dataset.num_steps,
-        windows_per_episode_factor=cfg.data.get("windows_per_episode_factor", 1.0),
-        max_gap=cfg.data.get("max_gap", 50),
-        geometric_p=cfg.data.get("geometric_p", 0.5),
+        fixed_gaps=cfg.data.get("fixed_gaps", [1]),
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
-        transform=transform,
-        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
-        fixed_gap=cfg.data.get("fixed_gap", 1),
+        transform=transform
     )
     train_dataset.episode_order = list(range(n_train))
 
     val_dataset = VariableHorizonDataset(
         lance_path=lance_path,
         num_steps=cfg.data.dataset.num_steps,
-        windows_per_episode_factor=cfg.data.get("val_windows_per_episode_factor", 0.2),
-        max_gap=cfg.data.get("max_gap", 50),
-        geometric_p=cfg.data.get("geometric_p", 0.5),
+        fixed_gaps=cfg.data.get("fixed_gaps", [1]),
         buffer_size=cfg.data.get("buffer_size", 2000),
         frameskip=cfg.data.dataset.frameskip,
         transform=transform,
-        gap_sampling=cfg.data.get("gap_sampling", "geometric"),
-        fixed_gap=cfg.data.get("fixed_gap", 1),
     )
     val_dataset.episode_order = list(range(n_train, total_episodes))
 

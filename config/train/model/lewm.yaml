@@ -13,10 +13,10 @@ predictor:
   num_frames: ${history_size}
   max_time: 500
   input_dim: ${embed_dim}
-  hidden_dim: ${embed_dim}
+  hidden_dim: 512
   output_dim: ${embed_dim}
-  depth: 6
-  heads: 16
+  depth: 15
+  heads: 8
   mlp_dim: 2048
   dim_head: 64
   dropout: 0.1
@@ -30,9 +30,9 @@ action_encoder:
 action_chunk_encoder:
   _target_: module.ActionChunkEncoder
   emb_dim: ${embed_dim}
-  depth: 2
+  depth: 8
   heads: 4
-  mlp_dim: 512
+  mlp_dim: 768
   dim_head: 64
   dropout: 0.0
   max_horizon: 50

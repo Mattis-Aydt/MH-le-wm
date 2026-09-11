@@ -22,7 +22,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 80
+  batch_size: 100
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
@@ -43,11 +43,9 @@ loss:
       num_proj: 1024
 
 
+
 data:
-  windows_per_episode_factor: 10.0   # 4× total data vs original
-  val_windows_per_episode_factor: 1.0
-  geometric_p: 0.25                   # 25% short, 75% variable
-  max_gap: 50
+  fixed_gaps: [1,2,3,4,5]   # or [1] for the pure baseline
   buffer_size: 500
 
 wandb:

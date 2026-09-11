@@ -1,6 +1,6 @@
 import io
 import random
-from typing import Optional
+from typing import Optional, Sequence, Union
 
 import lance
 import numpy as np
@@ -18,17 +18,17 @@ def decode_jpeg_bytes(jpeg_bytes):
 
 
 class VariableHorizonDataset(IterableDataset):
-    """Variable-horizon window dataset over a Lance file.
+    """Fixed-gap enumeration dataset over a Lance file.
 
-    Key properties:
+    Semantics (exact original le-wm equivalence):
+    - For every episode, for every gap g in fixed_gaps, EVERY valid window is
+      enumerated: all bundle starts where the window fits, times all phases
+      in [0, frameskip-1]. With fixed_gaps=[1] this yields exactly the window
+      set of the original le-wm dataset (a window starting at every raw
+      frame). fixed_gaps=[1, 2, 3] is the union of those homogeneous sets.
     - Lance is only ever read SEQUENTIALLY, one full episode at a time.
       All windows of that episode are decoded immediately (while the data
       is hot) and the shuffle buffer stores actual samples, not metadata.
-    - Phase-offset sampling: each window draws a phase p in [0, frameskip-1]
-      and starts at raw frame start*frameskip + p. Action bundles are
-      relative to the phase. This matches the original le-wm sampling,
-      which allowed window starts at ANY raw frame (~5x more distinct
-      windows per episode than bundle-aligned starts).
     - time_ids stay in BUNDLED units; train.py makes them window-relative.
     """
 
@@ -36,12 +36,7 @@ class VariableHorizonDataset(IterableDataset):
         self,
         lance_path: str,
         num_steps: int = 4,
-        windows_per_episode_factor: float = 1.0,
-        max_gap: int = 50,
-        geometric_p: float = 0.5,
-        gap_sampling: str = "geometric",   # geometric | fixed | uniform
-        fixed_gap: int = 1,
-
+        fixed_gaps: Union[int, Sequence[int]] = (1,),
         buffer_size: int = 1000,
         frameskip: int = 5,
         transform: Optional[callable] = None,
@@ -50,12 +45,9 @@ class VariableHorizonDataset(IterableDataset):
         self.lance_path = lance_path
         self.num_steps = num_steps
         self.num_gaps = num_steps - 1
-        self.windows_per_episode_factor = windows_per_episode_factor
-        self.max_gap = max_gap
-        self.geometric_p = geometric_p
-        self.gap_sampling = gap_sampling
-        self.fixed_gap = fixed_gap
-
+        if isinstance(fixed_gaps, int):
+            fixed_gaps = [fixed_gaps]
+        self.fixed_gaps = [int(g) for g in fixed_gaps]
         self.buffer_size = buffer_size
         self.frameskip = frameskip
         self.transform = transform
@@ -125,42 +117,38 @@ class VariableHorizonDataset(IterableDataset):
             return 7
         return 0
 
-    # ---------------- window sampling ----------------
+    # ---------------- window enumeration ----------------
 
-    def _sample_gaps(self):
-        if self.gap_sampling == "fixed":
-            return np.full(self.num_gaps, self.fixed_gap)
-        if self.gap_sampling == "uniform":
-            return np.random.randint(1, self.max_gap + 1, size=self.num_gaps)
-        # default: geometric (unchanged legacy behavior)
-        gaps = np.random.geometric(self.geometric_p, size=self.num_gaps)
-        gaps = np.clip(gaps, 1, self.max_gap)
-        return gaps
+    def _windows_per_episode(self, bundled_len):
+        """Exact window count of one episode over all gap classes."""
+        return sum(
+            max(0, bundled_len - g * self.num_gaps) * self.frameskip
+            for g in self.fixed_gaps
+        )
 
-    def _sample_window_params(self, episode_idx):
-        """Draw (start_offset, gaps, phase) tuples for one episode."""
+    def _episode_windows(self, episode_idx):
+        """Enumerate ALL (start, gap, phase) windows of one episode.
+
+        A window starting at bundle `start` with phase `phase` observes raw
+        frames start*frameskip+phase, (start+g)*frameskip+phase, ... — so
+        gap=1 with all phases covers exactly the raw-frame starts of the
+        original le-wm sampling.
+        """
         bundled_len = self.episode_lengths[episode_idx] // self.frameskip
-        n_windows = max(1, int(bundled_len * self.windows_per_episode_factor))
         params = []
-        for _ in range(n_windows):
-            gaps = self._sample_gaps()
-            total_span = gaps.sum()
-            if total_span >= bundled_len:
-                continue
-            start_offset = random.randint(0, bundled_len - total_span - 1)
-            phase = random.randint(0, self.frameskip - 1)
-            params.append((start_offset, gaps, phase))
+        for g in self.fixed_gaps:
+            span = g * self.num_gaps
+            for start in range(bundled_len - span):
+                for phase in range(self.frameskip):
+                    params.append((start, g, phase))
         return params
 
-    def _materialize_window(self, ep_data, start_offset, gaps, phase):
+    def _materialize_window(self, ep_data, start, gap, phase):
         """Decode + transform one window from already-loaded episode data."""
         raw_actions, pixels, proprio, state = ep_data
 
         # bundled-unit time ids (train.py makes them window-relative)
-        time_ids = [start_offset]
-        for g in gaps:
-            time_ids.append(time_ids[-1] + g)
-        time_ids = np.array(time_ids, dtype=np.int64)
+        time_ids = start + gap * np.arange(self.num_steps, dtype=np.int64)
 
         # raw frame indices of the observations, phase-shifted
         raw_obs_ids = time_ids * self.frameskip + phase
@@ -178,12 +166,6 @@ class VariableHorizonDataset(IterableDataset):
             flat.reshape(-1, self.frameskip * 2)
         ).float()  # (span, frameskip*2)
 
-        chunk_boundaries = []
-        for i in range(self.num_gaps):
-            cs = time_ids[i] - time_ids[0]
-            ce = time_ids[i + 1] - time_ids[0]
-            chunk_boundaries.append((cs, ce))
-
         sample = {
             "pixels": obs_pixels,
             "action": all_bundled,
@@ -198,12 +180,11 @@ class VariableHorizonDataset(IterableDataset):
             sample = self.transform(sample)
 
         normed = sample["action"]
-        action_chunks = []
-        action_lengths = []
-        for cs, ce in chunk_boundaries:
-            chunk = normed[cs:ce].numpy()
-            action_chunks.append(chunk)
-            action_lengths.append(len(chunk))
+        # homogeneous gaps: chunk j = bundles [j*gap, (j+1)*gap)
+        action_chunks = [
+            normed[j * gap:(j + 1) * gap].numpy() for j in range(self.num_gaps)
+        ]
+        action_lengths = [gap] * self.num_gaps
 
         sample["action_chunks"] = action_chunks
         sample["action_lengths"] = action_lengths
@@ -213,11 +194,9 @@ class VariableHorizonDataset(IterableDataset):
     # ---------------- iteration ----------------
 
     def __len__(self):
-        total = 0
-        for length in self.episode_lengths:
-            bundled_len = length // self.frameskip
-            total += max(1, int(bundled_len * self.windows_per_episode_factor))
-        return total
+        """Exact window count over the ACTIVE episode set (train/val split aware)."""
+        return sum(self._windows_per_episode(self.episode_lengths[ep] // self.frameskip)
+                   for ep in self.episode_order)
 
     def __iter__(self):
         # Shard episodes across workers so each window is yielded once per epoch
@@ -229,7 +208,7 @@ class VariableHorizonDataset(IterableDataset):
 
         buffer = []
         for episode_idx in episode_order:
-            params = self._sample_window_params(episode_idx)
+            params = self._episode_windows(episode_idx)
             if not params:
                 continue
 
@@ -237,9 +216,9 @@ class VariableHorizonDataset(IterableDataset):
             ep_data = self._load_episode(episode_idx)
 
             random.shuffle(params)
-            for start_offset, gaps, phase in params:
+            for start, gap, phase in params:
                 # Decode while the episode is hot; buffer stores the SAMPLE
-                buffer.append(self._materialize_window(ep_data, start_offset, gaps, phase))
+                buffer.append(self._materialize_window(ep_data, start, gap, phase))
                 if len(buffer) >= self.buffer_size:
                     idx = random.randint(0, len(buffer) - 1)
                     yield buffer.pop(idx)
