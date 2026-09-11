@@ -86,7 +86,10 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        model = swm.wm.utils.load_pretrained(
+    cfg.policy, extra_args={"steps_per_chunk": cfg.get("steps_per_chunk", 1)}
+)
+        model.steps_per_chunk = cfg.get("steps_per_chunk", 1)
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
